@@ -42,6 +42,7 @@ from MuRaL.preprocessing import *
 from MuRaL.evaluation import *
 from MuRaL.training import *
 from MuRaL._version import __version__
+from bayesian_torch.models.dnn_to_bnn import dnn_to_bnn, get_kl_loss
 
 import textwrap
 #from torch.utils.tensorboard import SummaryWriter
@@ -59,6 +60,7 @@ def parse_arguments(parser):
     model_args = parser.add_argument_group('Model-related arguments')
     learn_args = parser.add_argument_group('Learning-related arguments')
     raytune_args = parser.add_argument_group('RayTune-related arguments')
+    Bayes_args = parser.add_argument_group('Bayes-related arguments')
     optional.title = 'Other arguments' 
 
     required.add_argument('--ref_genome', type=str, metavar='FILE', default='',  
@@ -323,6 +325,42 @@ def parse_arguments(parser):
                           help=textwrap.dedent("""
                           Rerun errored or incomplete trials. Default: False.
                           """ ).strip())
+    Bayes_args.add_argument("--moped-init-model",
+        dest="moped_init_model",
+        help="DNN model to intialize MOPED method",
+        default="",
+        type=str,
+    )
+    Bayes_args.add_argument(
+        "--moped-delta-factor",
+        dest="moped_delta_factor",
+        help="MOPED delta scale factor",
+        default=0.2,
+        type=float,
+    )
+
+    Bayes_args.add_argument(
+        "--bnn-rho-init",
+        dest="bnn_rho_init",
+        help="rho init for bnn layers",
+        default=-3.0,
+        type=float,
+    )
+
+    Bayes_args.add_argument(
+        "--use-flipout-layers",
+        action='store_true',
+        default=False,
+        help="Use Flipout layers for BNNs, default is Reparameterization layers",
+    )
+    Bayes_args.add_argument(
+        "--num_monte_carlo",
+        type=int,
+        dest="num_monte_carlo",
+        default=10,
+        metavar="number of monte carlo times",
+        help="number of monte carlo times",
+    )
     
     optional.add_argument('-v', '--version', action='version',
                         version='%(prog)s {}'.format(__version__))
@@ -479,6 +517,9 @@ def main():
     learning_rate = args.learning_rate   
     weight_decay = args.weight_decay
     weight_decay_auto = args.weight_decay_auto
+    num_monte_carlo = args.num_monte_carlo
+    moped_delta_factor = args.moped_delta_factor
+    moped_init_model = args.moped_init_model
         
     LR_gamma = args.LR_gamma  
     epochs = args.epochs
