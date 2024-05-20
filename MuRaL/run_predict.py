@@ -6,17 +6,14 @@ from pybedtools import BedTool
 import sys
 import argparse
 import textwrap
-from sklearn.preprocessing import LabelEncoder
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader, SubsetRandomSampler
 
 import pandas as pd
 import numpy as np
 import pickle
 
-import os
 import time
 import datetime
 
@@ -27,6 +24,8 @@ from MuRaL.evaluation import *
 from MuRaL._version import __version__
 
 from pynvml import *
+
+from bayesian_torch.models.dnn_to_bnn import dnn_to_bnn
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.benchmark = True
@@ -39,6 +38,7 @@ def parse_arguments(parser):
     """ 
     optional = parser._action_groups.pop()
     required = parser.add_argument_group('Required arguments')
+    Bayes_args = parser.add_argument_group('Bayes-related arguments')
     optional.title = 'Other arguments' 
     
     required.add_argument('--ref_genome', type=str, metavar='FILE', default='',  
@@ -111,7 +111,54 @@ def parse_arguments(parser):
     
     optional.add_argument('-v', '--version', action='version',
                         version='%(prog)s {}'.format(__version__))
-    
+
+    Bayes_args.add_argument("--moped-init-model",
+        dest="moped_init_model",
+        help="DNN model to intialize MOPED method",
+        default="",
+        type=str,
+    )
+    Bayes_args.add_argument(
+        "--moped-delta-factor",
+        dest="moped_delta_factor",
+        help="MOPED delta scale factor",
+        default=0.2,
+        type=float,
+    )
+
+    Bayes_args.add_argument(
+        "--bnn-rho-init",
+        dest="bnn_rho_init",
+        help="rho init for bnn layers",
+        default=-3.0,
+        type=float,
+    )
+
+    Bayes_args.add_argument(
+        "--use-flipout-layers",
+        action='store_true',
+        default=False,
+        help="Use Flipout layers for BNNs, default is Reparameterization layers",
+    )
+    Bayes_args.add_argument(
+        "--num_monte_carlo",
+        type=int,
+        dest="num_monte_carlo",
+        default=10,
+        metavar="number of monte carlo times",
+        help="number of monte carlo times",
+    )
+    Bayes_args.add_argument("--mode", type=str, dest="mode", help="train | test | ptq")
+    Bayes_args.add_argument('--validation_data', type=str, metavar='FILE', default=None,
+                          help=textwrap.dedent("""
+                          File path for validation data. If this option is set,
+                          the value of --valid_ratio will be ignored. Default: None.
+                          """).strip())
+    Bayes_args.add_argument('--batch_size', type=int, metavar='INT', default=[128], nargs='+', 
+                          help=textwrap.dedent("""
+                          Size of mini batches for model training. Default: 128.
+                          """ ).strip())
+
     parser._action_groups.append(optional)
     
     if len(sys.argv) == 1:
@@ -181,7 +228,8 @@ def main():
         print("{0}: {1}".format(k,v))
 
     # Set input file
-    test_file = args.test_data   
+    test_file = args.test_data
+    valid_file = args.validation_data   
     ref_genome= args.ref_genome
 
     pred_batch_size = args.pred_batch_size
@@ -245,7 +293,13 @@ def main():
     bw_files = []
     bw_names = []
     bw_radii = []
-    
+
+    ##Bayesian Deeplearning Network Parameters
+    num_monte_carlo = args.num_monte_carlo
+    use_flipout_layers = args.use_flipout_layers
+    mode = args.mode
+
+
     if bw_paths:
         try:
             bw_list = pd.read_table(bw_paths, sep='\s+', header=None, comment='#')
@@ -262,6 +316,17 @@ def main():
 
     # Get the H5 file path for testing data
     test_h5f_path = get_h5f_path(test_file, bw_names, distal_radius, distal_order, without_bw_distal)
+
+    # Prepare valid data for Post Training Quantization (PTQ)
+    if valid_file:
+        print('using given validation file:', valid_file)
+        valid_bed = BedTool(valid_file)
+        valid_h5f_path = get_h5f_path(valid_file, bw_names, config['distal_radius'], distal_order, without_bw_distal)
+        dataset_valid = prepare_dataset_h5(valid_bed, ref_genome, bw_paths, bw_files, bw_names, bw_radii, config['local_radius'], config['local_order'], config['distal_radius'], distal_order, valid_h5f_path, chunk_size=5000, seq_only=seq_only, n_h5_files=n_h5_files, without_bw_distal=without_bw_distal)    
+        # Dataloader for QuanlityCalib
+        subset_size = int(len(dataset_valid) / 10)
+        sampler = SubsetRandomSampler(torch.randperm(len(dataset_valid))[:subset_size])  
+        calib_loader = DataLoader(dataset_valid, batch_size=config['batch_size'], sampler=sampler, num_workers=0, pin_memory=True)
 
     # Prepare testing data 
     if without_h5:
@@ -319,6 +384,19 @@ def main():
     else:
         print('Error: no model selected!')
         sys.exit() 
+    
+    ##Set bnn parameters  
+    const_bnn_prior_parameters = {
+        "prior_mu": 0.0,
+        "prior_sigma": 1.0,
+        "posterior_mu_init": 0.0,
+        "posterior_rho_init": -3.0,
+        "type": "Flipout" if use_flipout_layers else "Reparameterization",  # Flipout or Reparameterization
+        "moped_enable": False,  # initialize mu/sigma from the dnn weights
+        "moped_delta": 0.5,
+    }
+    
+    dnn_to_bnn(model, const_bnn_prior_parameters)  # only replaces linear and conv layers    
 
     print('model:')
     print(model)
@@ -328,13 +406,18 @@ def main():
     model.load_state_dict(model_state)
     
     del model_state
-    torch.cuda.empty_cache() 
+    torch.cuda.empty_cache()
+
+    if args.mode == "ptq":
+        model = quantize(model, calib_loader)
+        print(model)
 
     # Loss function
     criterion = torch.nn.CrossEntropyLoss(reduction='sum')
     
     # Set prob names for mutation types
     prob_names = ['prob'+str(i) for i in range(n_class)]
+    prob_std_names = ['prob_std'+str(i) for i in range(n_class)]
 
     # Dataloader for testing data    
     if cpu_only:
@@ -343,33 +426,37 @@ def main():
         dataloader = DataLoader(dataset_test, batch_size=pred_batch_size, shuffle=False, num_workers=0)   
 
     # Do the prediction
-    pred_y, test_total_loss = model_predict_m(model, dataloader, criterion, device, n_class, distal=True)
+    pred_y, pred_y_std, test_total_loss = model_predict_m(model, dataloader, criterion, device, n_class, num_monte_carlo, distal=True)
     
     # Print some data for debugging
-    print('pred_y:', F.softmax(pred_y[1:10], dim=1))
+    print('pred_y:', pred_y[1:10])
     for i in range(1, n_class):
-        print('min and max of pred_y: type', i, np.min(to_np(F.softmax(pred_y, dim=1))[:,i]), np.max(to_np(F.softmax(pred_y, dim=1))[:,i]))
+        print('min and max of pred_y: type', i, np.min(to_np(pred_y)[:,i]), np.max(to_np(pred_y)[:,i]))
         
     # Get the predicted probabilities, as the returns of model are logits    
-    y_prob = pd.DataFrame(data=to_np(F.softmax(pred_y, dim=1)), columns=prob_names)
-    
+    y_prob = pd.DataFrame(data=to_np(pred_y), columns=prob_names)
+    print('y_prob1:', y_prob[1:10])
+    y_prob_std = pd.DataFrame(data=to_np(pred_y_std), columns=prob_std_names)
+    y_prob_withstd = y_prob.astype(str) + " ± " + y_prob_std.astype(str)
     # Do probability calibration using saved calibrator
     if calibrator_path != '':
-        with open(calibrator_path, 'rb') as fcal:   
+        with open(calibrator_path, 'rb') as fcal:
             print('using calibrator for scaling ...')
             calibr = pickle.load(fcal)         
             prob_cal = calibr.predict_proba(y_prob.to_numpy())  
             y_prob = pd.DataFrame(data=np.copy(prob_cal), columns=prob_names)
-    
+
+    print('y_prob after calib.:', y_prob[1:10])
+   
     print('Mean Loss, Total Loss, Test Size:', test_total_loss/test_size, test_total_loss, test_size)
     
     # Combine data 
-    data_and_prob = pd.concat([data_local_test, y_prob], axis=1)         
+    data_and_prob = pd.concat([data_local_test, y_prob, y_prob_std], axis=1)         
 
     # Write the prediction
-    test_pred_df = data_and_prob[['mut_type'] + prob_names]
+    test_pred_df = data_and_prob[['mut_type'] + prob_names + prob_std_names]
     pred_df = pd.concat((test_bed.to_dataframe()[['chrom', 'start', 'end', 'strand']], test_pred_df), axis=1)
-    pred_df.columns = ['chrom', 'start', 'end', 'strand', 'mut_type'] +  prob_names
+    pred_df.columns = ['chrom', 'start', 'end', 'strand', 'mut_type'] +  prob_names + prob_std_names
     pred_df.to_csv(pred_file, sep='\t', float_format='%.4g', index=False)
     
     #do k-mer evaluation
@@ -395,7 +482,6 @@ def main():
                 print('regional corr:', str(win_size)+'bp', corr)
 
     print('Total time used: %s seconds' % (time.time() - start_time))
-   
     
 if __name__ == "__main__":
     main()
