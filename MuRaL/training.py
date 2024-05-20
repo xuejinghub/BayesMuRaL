@@ -37,6 +37,10 @@ from MuRaL.nn_utils import *
 from MuRaL.preprocessing import *
 from MuRaL.evaluation import *
 
+from bayesian_torch.models.dnn_to_bnn import dnn_to_bnn, get_kl_loss
+from bayesian_torch.ao.quantization.quantize import enable_prepare, convert
+from bayesian_torch.models.bnn_to_qbnn import bnn_to_qbnn
+
 #from torchsampler import ImbalancedDatasetSampler
 
 
@@ -94,7 +98,13 @@ def train(config, args, checkpoint_dir=None):
     bw_files = []
     bw_names = []
     bw_radii = []
-    
+
+    ##Bayesian Deeplearning Network Parameters
+    num_monte_carlo = args.num_monte_carlo
+    use_flipout_layers = args.use_flipout_layers
+    moped_delta_factor = args.moped_delta_factor
+    moped_init_model = args.moped_init_model
+
     if cudnn_benchmark_false:
         torch.backends.cudnn.benchmark = False
         print('NOTE: setting torch.backends.cudnn.benchmark = False')
@@ -200,6 +210,8 @@ def train(config, args, checkpoint_dir=None):
     
     # Dataloader for predicting
     dataloader_valid = DataLoader(dataset_valid, config['batch_size'], shuffle=False, num_workers=0, pin_memory=True)
+    # Dataloader for QuanlityCalib
+    calib_loader = dataloader_valid
 
     if config['transfer_learning']:
         emb_dims = config['emb_dims']
@@ -240,6 +252,30 @@ def train(config, args, checkpoint_dir=None):
         print('Error: no model selected!')
         sys.exit() 
     
+    moped_enable = False
+    if len(args.moped_init_model) > 0:  # use moped method if trained dnn model weights are provided
+        moped_enable = True
+
+    ##Set bnn parameters  
+    const_bnn_prior_parameters = {
+        "prior_mu": 0.0,
+        "prior_sigma": 1.0,
+        "posterior_mu_init": 0.0,
+        "posterior_rho_init": -3.0,
+        "type": "Flipout" if args.use_flipout_layers else "Reparameterization",  # Flipout or Reparameterization
+        "moped_enable": moped_enable,  # initialize mu/sigma from the dnn weights
+        "moped_delta": 0.5,
+    }
+
+    if moped_enable:
+        checkpoint = torch.load(args.moped_init_model, map_location=device)
+        if "state_dict" in checkpoint.keys():
+            model.load_state_dict(checkpoint["state_dict"])
+        else:
+            model.load_state_dict(checkpoint)
+    
+    dnn_to_bnn(model, const_bnn_prior_parameters)  # only replaces linear and conv layers
+
     model.to(device)
     # Count the parameters in the model
     total_params = count_parameters(model)
@@ -286,9 +322,9 @@ def train(config, args, checkpoint_dir=None):
             # Re-initialize fc layers
             model.local_fc[-1].apply(weights_init)
             model.distal_fc[-1].apply(weights_init)    
-    else:
+    # else:
         # Initiating weights of the models;
-        model.apply(weights_init)
+        # model.apply(weights_init)
     
     # Set loss function
     criterion = torch.nn.CrossEntropyLoss(reduction='sum')
@@ -362,11 +398,17 @@ def train(config, args, checkpoint_dir=None):
             cont_x = cont_x.to(device)
             distal_x = distal_x.to(device)
             y  = y.to(device)
-
-
-            # Forward Pass
-            preds = model.forward((cont_x, cat_x), distal_x)
-            loss = criterion(preds, y.long().squeeze())
+            output_ = []
+            kl_ = []
+            for mc_run in range(int(args.num_monte_carlo)):
+                output = model.forward((cont_x, cat_x), distal_x)
+                kl = get_kl_loss(model)
+                output_.append(output)
+                kl_.append(kl)
+            output = torch.mean(torch.stack(output_), dim=0)
+            kl = torch.mean(torch.stack(kl_), dim=0)
+            ce_loss = criterion(output, y.long().squeeze())
+            loss = ce_loss + (kl / config['batch_size'])
                    
             optimizer.zero_grad()
             loss.backward()
@@ -400,10 +442,11 @@ def train(config, args, checkpoint_dir=None):
                 #print('F.softmax(model.models_w):', F.softmax(model.models_w, dim=0))
                 #print('model.conv1[0].weight.grad:', model.conv1[0].weight.grad)
             #print('model.conv1.0.weight.grad:', model.conv1.0.weight)
+                
+            valid_pred_y, valid_pred_y_std, valid_total_loss = model_predict_m(model, dataloader_valid, criterion, device, n_class, num_monte_carlo, distal=True)
 
-            valid_pred_y, valid_total_loss = model_predict_m(model, dataloader_valid, criterion, device, n_class, distal=True)
-
-            valid_y_prob = pd.DataFrame(data=to_np(F.softmax(valid_pred_y, dim=1)), columns=prob_names)
+            # valid_y_prob = pd.DataFrame(data=to_np(F.softmax(valid_pred_y, dim=1)), columns=prob_names)
+            valid_y_prob = pd.DataFrame(data=to_np(valid_pred_y), columns=prob_names)
             
             if not valid_file:
                 valid_data_and_prob = pd.concat([data_local.iloc[dataset_valid.indices, ].reset_index(drop=True), valid_y_prob], axis=1)
